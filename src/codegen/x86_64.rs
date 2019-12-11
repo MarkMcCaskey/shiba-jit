@@ -1,11 +1,15 @@
 use crate::ir::*;
 use std::collections::*;
+use std::mem;
+use std::iter;
 
+#[derive(Debug, Clone)]
 struct Register {
     _type: PrimitiveValue,
     value: RegisterValueLocation,
 }
 
+#[derive(Debug, Clone)]
 pub enum RegisterValueLocation {
     Constant(usize),
     DependsOn(Vec<usize>),
@@ -35,6 +39,59 @@ pub enum MachineRegister {
     R13,
     R14,
     R15,
+}
+
+impl MachineRegister {
+    fn mov_prefix(&self) -> [u8; 2] {
+        match self {
+            MachineRegister::Rax => [0x48, 0xB8],
+            MachineRegister::Rcx => [0x48, 0xB9],
+            MachineRegister::Rdx => [0x48, 0xBA],
+            MachineRegister::Rbx => [0x48, 0xBB],
+            MachineRegister::Rsi => [0x48, 0xBE],
+            MachineRegister::Rdi => [0x48, 0xBF],
+            MachineRegister::R8 => [0x49, 0xB8],
+            MachineRegister::R9 => [0x49, 0xB9],
+            MachineRegister::R10 => [0x49, 0xBA],
+            MachineRegister::R11 => [0x49, 0xBB],
+            MachineRegister::R12 => [0x49, 0xBC],
+            MachineRegister::R13 => [0x49, 0xBD],
+            MachineRegister::R14 => [0x49, 0xBE],
+            MachineRegister::R15 => [0x49, 0xBF],
+        }
+    }
+}
+
+fn emit_mov_imm(out: &mut Vec<u8>, dest: MachineRegister, imm: usize, _type: PrimitiveValue) {
+    out.extend(dest.mov_prefix().into_iter());
+    match _type {
+        PrimitiveValue::U8 | PrimitiveValue::I8 => {
+            let val = imm as u8;
+            // 32bit
+            out.push(0xC7);
+            out.extend(val.to_le_bytes().into_iter());
+            out.extend(&[0,0,0]);
+        }
+        PrimitiveValue::U16 | PrimitiveValue::I16 => {
+            let val = imm as u16;
+            // 32bit
+            out.push(0xC7);
+            out.extend(val.to_le_bytes().into_iter());
+            out.extend(&[0,0]);
+        }
+        PrimitiveValue::U32 | PrimitiveValue::I32 => {
+            let val = imm as u32;
+            // 32bit
+            out.push(0xC7);
+            out.extend(val.to_le_bytes().into_iter());
+        }
+        PrimitiveValue::U64 | PrimitiveValue::I64 => {
+            let val = imm as u64;
+            // 64bit
+            out.push(0xB8);
+            out.extend(val.to_le_bytes().into_iter());
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -228,15 +285,30 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
     for (location, instruction) in instruction_stream.iter().enumerate() {
         match *instruction {
             IR::Immediate {
-                dest_register,
-                _type,
-                value,
                 ..
             } => {
-                
+                // do nothing here
             }
+            IR::Add {
+                dest_register,
+                src_register1,
+                src_register2,
+            } => {
+                match (&register_map[&src_register1].value, &register_map[&src_register2].value) {
+                    (RegisterValueLocation::Constant(c1), RegisterValueLocation::Constant(c2)) => {
+                        // mov
+                        // mov is 0x48 or 0x49 depending on regsiter
+                        let _type = register_map[&src_register1]._type;
+                        let dest_reg = machine_register_map[&dest_register];
+                        emit_mov_imm(&mut out, dest_reg, c1 + c2, _type);
+                    }
+                    _ => panic!("Instruction not yet implemented in codegen"),
+                }
+            }
+
+            _ => panic!("Instruction not yet implemented in codegen"),
         }
     }
 
-    out
+    Ok(out)
 }
