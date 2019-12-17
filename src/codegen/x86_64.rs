@@ -1,7 +1,10 @@
 use crate::ir::*;
 use std::collections::*;
-use std::mem;
 use std::iter;
+use std::mem;
+
+use dynasmrt::x64::Assembler;
+use dynasmrt::{mmap::ExecutableBuffer, DynasmApi, DynasmLabelApi};
 
 #[derive(Debug, Clone)]
 struct Register {
@@ -25,71 +28,53 @@ pub struct CodeGenError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineRegister {
-    Rax,
-    Rcx,
-    Rdx,
-    Rbx,
-    Rsi,
-    Rdi,
-    R8,
-    R9,
-    R10,
-    R11,
-    R12,
-    R13,
-    R14,
-    R15,
+    Rax = 0,
+    Rcx = 1,
+    Rdx = 2,
+    Rbx = 3,
+    Rsp = 4,
+    Rbp = 5,
+    Rsi = 6,
+    Rdi = 7,
+    R8 = 8,
+    R9 = 9,
+    R10 = 10,
+    R11 = 11,
+    R12 = 12,
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
 }
 
-impl MachineRegister {
-    fn mov_prefix(&self) -> [u8; 2] {
-        match self {
-            MachineRegister::Rax => [0x48, 0xB8],
-            MachineRegister::Rcx => [0x48, 0xB9],
-            MachineRegister::Rdx => [0x48, 0xBA],
-            MachineRegister::Rbx => [0x48, 0xBB],
-            MachineRegister::Rsi => [0x48, 0xBE],
-            MachineRegister::Rdi => [0x48, 0xBF],
-            MachineRegister::R8 => [0x49, 0xB8],
-            MachineRegister::R9 => [0x49, 0xB9],
-            MachineRegister::R10 => [0x49, 0xBA],
-            MachineRegister::R11 => [0x49, 0xBB],
-            MachineRegister::R12 => [0x49, 0xBC],
-            MachineRegister::R13 => [0x49, 0xBD],
-            MachineRegister::R14 => [0x49, 0xBE],
-            MachineRegister::R15 => [0x49, 0xBF],
-        }
-    }
-}
-
-fn emit_mov_imm(out: &mut Vec<u8>, dest: MachineRegister, imm: usize, _type: PrimitiveValue) {
-    out.extend(dest.mov_prefix().into_iter());
+fn emit_mov_imm(ops: &mut Assembler, dest: MachineRegister, imm: usize, _type: PrimitiveValue) {
     match _type {
         PrimitiveValue::U8 | PrimitiveValue::I8 => {
-            let val = imm as u8;
+            let val = imm as u8 as i32;
             // 32bit
-            out.push(0xC7);
-            out.extend(val.to_le_bytes().into_iter());
-            out.extend(&[0,0,0]);
+            dynasm!(ops
+                    ; mov Ra(dest as u8), BYTE val
+            );
         }
         PrimitiveValue::U16 | PrimitiveValue::I16 => {
-            let val = imm as u16;
+            let val = imm as u16 as i32;
             // 32bit
-            out.push(0xC7);
-            out.extend(val.to_le_bytes().into_iter());
-            out.extend(&[0,0]);
+            dynasm!(ops
+                    ; mov Ra(dest as u8), WORD val
+            );
         }
         PrimitiveValue::U32 | PrimitiveValue::I32 => {
-            let val = imm as u32;
+            let val = imm as i32;
             // 32bit
-            out.push(0xC7);
-            out.extend(val.to_le_bytes().into_iter());
+            dynasm!(ops
+                    ; mov Ra(dest as u8), DWORD val
+            );
         }
         PrimitiveValue::U64 | PrimitiveValue::I64 => {
-            let val = imm as u64;
+            let val = imm as i64;
             // 64bit
-            out.push(0xB8);
-            out.extend(val.to_le_bytes().into_iter());
+            dynasm!(ops
+                    ; mov Ra(dest as u8), QWORD val
+            );
         }
     }
 }
@@ -105,38 +90,58 @@ pub enum CodeGenErrorReason {
     RegisterValueTaken(usize),
     RegisterNotFound(usize),
     TypeMismatch(PrimitiveValue, PrimitiveValue),
+    CodeGenFailure,
 }
 
-pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError> {
-    let mut out = vec![];
-    let mut register_map: BTreeMap<usize, Register> = BTreeMap::new();
-    // when the registers were first seen
-    let mut register_first_seen: BTreeMap<usize, usize> = BTreeMap::new();
-    // when the registers were last seen
-    let mut register_last_seen: BTreeMap<usize, usize> = BTreeMap::new();
-    // label_id -> idx in out
-    let mut label_map: BTreeMap<usize, usize> = BTreeMap::new();
+#[derive(Debug, Default)]
+pub struct CodeGenState {
+    register_map: BTreeMap<usize, Register>,
+    /// when the registers were first seen
+    register_first_seen: BTreeMap<usize, usize>,
+    /// when the registers were last seen
+    register_last_seen: BTreeMap<usize, usize>,
+    /// label_id -> idx in out
+    label_map: BTreeMap<usize, usize>,
+}
 
-    let get_register = |register, location| {
-        register_last_seen[&register] = location;
-        register_map.get(&register).ok_or_else(|| CodeGenError {
-            location,
-            reason: CodeGenErrorReason::RegisterNotFound(register),
-        })
-    };
-
-    let create_register = |register, _type, value, location| {
-        let res = register_map.insert(register, Register { _type, value });
+impl CodeGenState {
+    fn create_register(
+        &mut self,
+        register: usize,
+        _type: PrimitiveValue,
+        value: RegisterValueLocation,
+        location: usize,
+    ) -> Result<(), CodeGenError> {
+        let res = self
+            .register_map
+            .insert(register, Register { _type, value });
         if res.is_some() {
             return Err(CodeGenError {
                 location,
                 reason: CodeGenErrorReason::RegisterValueTaken(register),
             });
         }
-        register_first_seen.insert(register, location);
-        register_last_seen.insert(register, location);
+        self.register_first_seen.insert(register, location);
+        self.register_last_seen.insert(register, location);
         Ok(())
-    };
+    }
+
+    fn get_register(&mut self, register: usize, location: usize) -> Result<Register, CodeGenError> {
+        *self.register_last_seen.get_mut(&register).unwrap() = location;
+        self.register_map
+            .get(&register)
+            .cloned()
+            .ok_or_else(|| CodeGenError {
+                location,
+                reason: CodeGenErrorReason::RegisterNotFound(register),
+            })
+    }
+}
+
+pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, CodeGenError> {
+    let mut ops = Assembler::new().unwrap();
+
+    let mut cgs = CodeGenState::default();
 
     let assert_type = |type1, type2, location| {
         if type1 == type2 {
@@ -158,7 +163,7 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
                 ..
             } => {
                 let value = RegisterValueLocation::Constant(value);
-                create_register(dest_register, _type, value, location)?;
+                cgs.create_register(dest_register, _type, value, location)?;
             }
             IR::Add {
                 dest_register,
@@ -180,12 +185,12 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
                 src_register1,
                 src_register2,
             } => {
-                let reg1 = get_register(src_register1, location)?;
-                let reg2 = get_register(src_register2, location)?;
+                let reg1 = cgs.get_register(src_register1, location)?;
+                let reg2 = cgs.get_register(src_register2, location)?;
                 assert_type(reg1._type, reg2._type, location)?;
 
                 let value = RegisterValueLocation::DependsOn(vec![src_register1, src_register2]);
-                create_register(dest_register, reg1._type, value, location)?;
+                cgs.create_register(dest_register, reg1._type, value, location)?;
             }
             IR::Load {
                 dest_register,
@@ -195,14 +200,14 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
                 dest_register,
                 src_register,
             } => {
-                let src = get_register(src_register, location)?;
+                let src = cgs.get_register(src_register, location)?;
 
                 let value = RegisterValueLocation::DependsOn(vec![src_register]);
-                create_register(dest_register, src._type, value, location)?;
+                cgs.create_register(dest_register, src._type, value, location)?;
             }
             IR::Label { label_idx } => {
                 // TODO error checking here
-                let res = label_map.insert(label_idx, location);
+                let res = cgs.label_map.insert(label_idx, location);
                 assert!(res.is_none());
             }
             IR::JumpIfEqual {
@@ -214,8 +219,8 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
                 label_idx,
             } => {
                 // TODO error checking here
-                assert!(label_map.contains_key(&label_idx));
-                get_register(src_register, location)?;
+                assert!(cgs.label_map.contains_key(&label_idx));
+                cgs.get_register(src_register, location)?;
             }
         }
     }
@@ -229,16 +234,16 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
     // TODO: should use a set not a vec
     let mut register_events: BTreeMap<usize, HashSet<RegisterEvent>> = BTreeMap::new();
 
-    for (register, location) in register_first_seen.iter() {
-        if let RegisterValueLocation::Constant(_) = register_map[register].value {
+    for (register, location) in cgs.register_first_seen.iter() {
+        if let RegisterValueLocation::Constant(_) = cgs.register_map[register].value {
             // constants don't need a register allocated
             continue;
         }
         let mut inserter = register_events.entry(*location).or_default();
         inserter.insert(RegisterEvent::Acquire(*register));
     }
-    for (register, location) in register_last_seen.iter() {
-        if let RegisterValueLocation::Constant(_) = register_map[register].value {
+    for (register, location) in cgs.register_last_seen.iter() {
+        if let RegisterValueLocation::Constant(_) = cgs.register_map[register].value {
             // constants don't need a register allocated
             continue;
         }
@@ -284,9 +289,7 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
 
     for (location, instruction) in instruction_stream.iter().enumerate() {
         match *instruction {
-            IR::Immediate {
-                ..
-            } => {
+            IR::Immediate { .. } => {
                 // do nothing here
             }
             IR::Add {
@@ -294,13 +297,16 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
                 src_register1,
                 src_register2,
             } => {
-                match (&register_map[&src_register1].value, &register_map[&src_register2].value) {
+                match (
+                    &cgs.register_map[&src_register1].value,
+                    &cgs.register_map[&src_register2].value,
+                ) {
                     (RegisterValueLocation::Constant(c1), RegisterValueLocation::Constant(c2)) => {
                         // mov
                         // mov is 0x48 or 0x49 depending on regsiter
-                        let _type = register_map[&src_register1]._type;
+                        let _type = cgs.register_map[&src_register1]._type;
                         let dest_reg = machine_register_map[&dest_register];
-                        emit_mov_imm(&mut out, dest_reg, c1 + c2, _type);
+                        emit_mov_imm(&mut ops, dest_reg, c1 + c2, _type);
                     }
                     _ => panic!("Instruction not yet implemented in codegen"),
                 }
@@ -310,5 +316,8 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<Vec<u8>, CodeGenError>
         }
     }
 
-    Ok(out)
+    ops.finalize().map_err(|_| CodeGenError {
+        location: 0,
+        reason: CodeGenErrorReason::CodeGenFailure,
+    })
 }
