@@ -64,4 +64,7 @@ pub enum IR {
         src_register: usize,
         label_idx: usize,
     },
+    Print {
+        value: String,
+    },
 }

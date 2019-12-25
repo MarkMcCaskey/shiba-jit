@@ -4,7 +4,7 @@ use std::iter;
 use std::mem;
 
 use dynasmrt::x64::Assembler;
-use dynasmrt::{mmap::ExecutableBuffer, DynasmApi, DynasmLabelApi};
+use dynasmrt::{mmap::ExecutableBuffer, AssemblyOffset, DynasmApi, DynasmLabelApi};
 
 #[derive(Debug, Clone)]
 struct Register {
@@ -44,6 +44,14 @@ pub enum MachineRegister {
     R13 = 13,
     R14 = 14,
     R15 = 15,
+}
+
+pub extern "C" fn guest_print(buffer: *const u8, len: u64) {
+    dbg!("MADE IT");
+    use std::io::Write;
+    std::io::stdout()
+        .write_all(unsafe { std::slice::from_raw_parts(buffer, len as usize) })
+        .unwrap()
 }
 
 fn emit_mov_imm(ops: &mut Assembler, dest: MachineRegister, imm: usize, _type: PrimitiveValue) {
@@ -138,8 +146,16 @@ impl CodeGenState {
     }
 }
 
-pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, CodeGenError> {
+pub fn generate_code(
+    instruction_stream: &[IR],
+) -> Result<(ExecutableBuffer, AssemblyOffset), CodeGenError> {
     let mut ops = Assembler::new().unwrap();
+
+    dynasm!(ops
+            ; .arch x64
+    );
+
+    let mut start_offset = ops.offset();
 
     let mut cgs = CodeGenState::default();
 
@@ -222,6 +238,13 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, Code
                 assert!(cgs.label_map.contains_key(&label_idx));
                 cgs.get_register(src_register, location)?;
             }
+            IR::Print { ref value } => {
+                dynasm!(ops
+                        ; ->hello:
+                        ; .bytes value.as_bytes()
+                );
+            }
+            _ => (),
         }
     }
 
@@ -252,12 +275,8 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, Code
     }
     let mut registers = VecDeque::new();
     // init register queue
-    registers.push_back(MachineRegister::Rax);
-    registers.push_back(MachineRegister::Rcx);
     registers.push_back(MachineRegister::Rdx);
     registers.push_back(MachineRegister::Rbx);
-    registers.push_back(MachineRegister::Rsi);
-    registers.push_back(MachineRegister::Rdi);
     registers.push_back(MachineRegister::R8);
     registers.push_back(MachineRegister::R9);
     registers.push_back(MachineRegister::R10);
@@ -287,7 +306,13 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, Code
     // =================================================================
     // generate some machine code
 
+    start_offset = ops.offset();
+    let mut label_map: BTreeMap<usize, _> = BTreeMap::new();
     for (location, instruction) in instruction_stream.iter().enumerate() {
+        if let Some(v) = label_map.get(&location) {
+            dynasm!(ops
+                    ; =>*v);
+        }
         match *instruction {
             IR::Immediate { .. } => {
                 // do nothing here
@@ -297,6 +322,8 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, Code
                 src_register1,
                 src_register2,
             } => {
+                let dest_reg = machine_register_map[&dest_register];
+                let _type = cgs.register_map[&src_register1]._type;
                 match (
                     &cgs.register_map[&src_register1].value,
                     &cgs.register_map[&src_register2].value,
@@ -304,20 +331,110 @@ pub fn generate_code(instruction_stream: &[IR]) -> Result<ExecutableBuffer, Code
                     (RegisterValueLocation::Constant(c1), RegisterValueLocation::Constant(c2)) => {
                         // mov
                         // mov is 0x48 or 0x49 depending on regsiter
-                        let _type = cgs.register_map[&src_register1]._type;
-                        let dest_reg = machine_register_map[&dest_register];
                         emit_mov_imm(&mut ops, dest_reg, c1 + c2, _type);
                     }
-                    _ => panic!("Instruction not yet implemented in codegen"),
+                    (RegisterValueLocation::Constant(c1), RegisterValueLocation::DependsOn(_)) => {
+                        emit_mov_imm(&mut ops, dest_reg, *c1, _type);
+                        dynasm!(ops
+                                ; add Ra(dest_reg as u8), Ra(src_register2 as u8));
+                    }
+                    (RegisterValueLocation::DependsOn(_), RegisterValueLocation::Constant(c2)) => {
+                        emit_mov_imm(&mut ops, dest_reg, *c2, _type);
+                        dynasm!(ops
+                                ; add Ra(dest_reg as u8), Ra(src_register1 as u8));
+                    }
+                    (RegisterValueLocation::DependsOn(_), RegisterValueLocation::DependsOn(_)) => {
+                        dynasm!(ops
+                                ; mov Ra(dest_reg as u8), Ra(src_register1 as u8)
+                                ; add Ra(dest_reg as u8), Ra(src_register2 as u8));
+                    }
+                    _ => panic!("Move cases not yet implemented in codegen"),
                 }
+            }
+            IR::Subtract {
+                dest_register,
+                src_register1,
+                src_register2,
+            } => {
+                let dest_reg = machine_register_map[&dest_register];
+                let _type = cgs.register_map[&src_register1]._type;
+                match (
+                    &cgs.register_map[&src_register1].value,
+                    &cgs.register_map[&src_register2].value,
+                ) {
+                    (RegisterValueLocation::Constant(c1), RegisterValueLocation::Constant(c2)) => {
+                        // mov
+                        // mov is 0x48 or 0x49 depending on regsiter
+                        emit_mov_imm(&mut ops, dest_reg, c1 - c2, _type);
+                    }
+                    (RegisterValueLocation::Constant(c1), RegisterValueLocation::DependsOn(_)) => {
+                        emit_mov_imm(&mut ops, dest_reg, *c1, _type);
+                        dynasm!(ops
+                                ; sub Ra(dest_reg as u8), Ra(src_register2 as u8));
+                    }
+                    (RegisterValueLocation::DependsOn(_), RegisterValueLocation::Constant(c2)) => {
+                        emit_mov_imm(&mut ops, dest_reg, *c2, _type);
+                        dynasm!(ops
+                                ; sub Ra(dest_reg as u8), Ra(src_register1 as u8));
+                    }
+                    (RegisterValueLocation::DependsOn(_), RegisterValueLocation::DependsOn(_)) => {
+                        dynasm!(ops
+                                ; mov Ra(dest_reg as u8), Ra(src_register1 as u8)
+                                ; sub Ra(dest_reg as u8), Ra(src_register2 as u8));
+                    }
+                    _ => panic!("Move cases not yet implemented in codegen"),
+                }
+            }
+            IR::JumpIfEqual {
+                src_register,
+                label_idx,
+            } => {
+                let jump_loc = label_map[&label_idx];
+
+                dynasm!(ops
+                        ; cmp Ra(src_register as u8), BYTE 0
+                        ; jz =>jump_loc
+                        ; ret );
+            }
+            IR::Print { ref value } => {
+                dynasm!(ops
+                        ; sub rsp, BYTE 0x28
+                        ; push rax
+                        ; push rdx
+                        ; push rcx
+                        ; push rbp
+                        ; mov rbp, rsp
+                        ; lea rcx, [->hello]
+                        ; xor edx, edx
+                        ; mov dl, BYTE value.len() as _
+                        ; mov rax, QWORD guest_print as _
+                        ; sub rsp, BYTE 0x28
+                        ; call rax
+                        ; add rsp, BYTE 0x28
+                        ; mov rsp, rbp
+                        ; pop rbp
+                        ; pop rcx
+                        ; pop rdx
+                        ; pop rax
+                        ; add rsp, BYTE 0x28
+                );
+            }
+            IR::Label { label_idx } => {
+                let jump_loc = ops.new_dynamic_label();
+                label_map.insert(label_idx, jump_loc);
+                dynasm!(ops
+                        ; =>jump_loc
+                );
             }
 
             _ => panic!("Instruction not yet implemented in codegen"),
         }
     }
 
-    ops.finalize().map_err(|_| CodeGenError {
-        location: 0,
-        reason: CodeGenErrorReason::CodeGenFailure,
-    })
+    ops.finalize()
+        .map_err(|_| CodeGenError {
+            location: 0,
+            reason: CodeGenErrorReason::CodeGenFailure,
+        })
+        .map(|r| (r, start_offset))
 }
