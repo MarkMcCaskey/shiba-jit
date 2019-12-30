@@ -10,3 +10,4 @@ edition = "2018"
 [dependencies]
 dynasm = "0.5"
 dynasmrt = "0.5"
+smallvec = "1"

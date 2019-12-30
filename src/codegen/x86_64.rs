@@ -4,7 +4,7 @@ use std::iter;
 use std::mem;
 
 use dynasmrt::x64::Assembler;
-use dynasmrt::{mmap::ExecutableBuffer, AssemblyOffset, DynasmApi, DynasmLabelApi};
+use dynasmrt::{mmap::ExecutableBuffer, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi};
 
 #[derive(Debug, Clone)]
 struct Register {
@@ -146,9 +146,21 @@ impl CodeGenState {
     }
 }
 
-pub fn generate_code(
-    instruction_stream: &[IR],
-) -> Result<(ExecutableBuffer, AssemblyOffset), CodeGenError> {
+pub fn set_up_constants(ctx: &Context, ops: &mut Assembler) -> BTreeMap<ConstantIndex, DynamicLabel> {
+    let mut constant_map: BTreeMap<ConstantIndex, DynamicLabel> = BTreeMap::new();
+    for (i, constant) in ctx.constants.iter().enumerate() {
+        // TODO: investigate dynamic vs global labels
+        let dyn_lab = ops.new_dynamic_label();
+        dynasm!(ops
+                ; => dyn_lab
+                ; .bytes constant.as_slice()
+        );
+        constant_map.insert(ConstantIndex::new(i), dyn_lab);
+    }
+    constant_map
+}
+
+pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset), CodeGenError> {
     let mut ops = Assembler::new().unwrap();
 
     dynasm!(ops
@@ -170,143 +182,69 @@ pub fn generate_code(
         }
     };
 
-    for (location, instruction) in instruction_stream.iter().enumerate() {
-        match *instruction {
-            IR::Immediate {
-                dest_register,
-                _type,
-                value,
-                ..
-            } => {
-                let value = RegisterValueLocation::Constant(value);
-                cgs.create_register(dest_register, _type, value, location)?;
-            }
-            IR::Add {
-                dest_register,
-                src_register1,
-                src_register2,
-            }
-            | IR::Subtract {
-                dest_register,
-                src_register1,
-                src_register2,
-            }
-            | IR::Multiply {
-                dest_register,
-                src_register1,
-                src_register2,
-            }
-            | IR::Divide {
-                dest_register,
-                src_register1,
-                src_register2,
-            } => {
-                let reg1 = cgs.get_register(src_register1, location)?;
-                let reg2 = cgs.get_register(src_register2, location)?;
-                assert_type(reg1._type, reg2._type, location)?;
+    // =================================================================
+    // set up the constants
 
-                let value = RegisterValueLocation::DependsOn(vec![src_register1, src_register2]);
-                cgs.create_register(dest_register, reg1._type, value, location)?;
-            }
-            IR::Load {
-                dest_register,
-                src_register,
-            }
-            | IR::Store {
-                dest_register,
-                src_register,
-            } => {
-                let src = cgs.get_register(src_register, location)?;
+    let constant_map = set_up_constants(ctx, &mut ops);
 
-                let value = RegisterValueLocation::DependsOn(vec![src_register]);
-                cgs.create_register(dest_register, src._type, value, location)?;
-            }
-            IR::Label { label_idx } => {
-                // TODO error checking here
-                let res = cgs.label_map.insert(label_idx, location);
-                assert!(res.is_none());
-            }
-            IR::JumpIfEqual {
-                src_register,
-                label_idx,
-            }
-            | IR::JumpIfNotEqual {
-                src_register,
-                label_idx,
-            } => {
-                // TODO error checking here
-                assert!(cgs.label_map.contains_key(&label_idx));
-                cgs.get_register(src_register, location)?;
-            }
-            IR::Print { ref value } => {
-                dynasm!(ops
-                        ; ->hello:
-                        ; .bytes value.as_bytes()
-                );
-            }
-            _ => (),
-        }
-    }
+    // =================================================================
+    // generate some machine code
+    start_offset = ops.offset();
 
-    // ===================================================================
-    // hack out some register allocation
-    //
-    // TODO: look up algorithms. something something 4 color theorem
-
-    // mapping from location to register event
-    // TODO: should use a set not a vec
-    let mut register_events: BTreeMap<usize, HashSet<RegisterEvent>> = BTreeMap::new();
-
-    for (register, location) in cgs.register_first_seen.iter() {
-        if let RegisterValueLocation::Constant(_) = cgs.register_map[register].value {
-            // constants don't need a register allocated
-            continue;
-        }
-        let mut inserter = register_events.entry(*location).or_default();
-        inserter.insert(RegisterEvent::Acquire(*register));
-    }
-    for (register, location) in cgs.register_last_seen.iter() {
-        if let RegisterValueLocation::Constant(_) = cgs.register_map[register].value {
-            // constants don't need a register allocated
-            continue;
-        }
-        let mut inserter = register_events.entry(*location).or_default();
-        inserter.insert(RegisterEvent::Release(*register));
-    }
-    let mut registers = VecDeque::new();
-    // init register queue
-    registers.push_back(MachineRegister::Rdx);
-    registers.push_back(MachineRegister::Rbx);
-    registers.push_back(MachineRegister::R8);
-    registers.push_back(MachineRegister::R9);
-    registers.push_back(MachineRegister::R10);
-    registers.push_back(MachineRegister::R11);
-    registers.push_back(MachineRegister::R12);
-    registers.push_back(MachineRegister::R13);
-    registers.push_back(MachineRegister::R14);
-    registers.push_back(MachineRegister::R15);
-
-    let mut machine_register_map: BTreeMap<usize, MachineRegister> = BTreeMap::new();
-
-    for (_, events) in register_events.iter() {
-        for event in events.iter() {
-            match event {
-                RegisterEvent::Acquire(r) => {
-                    let register = registers.pop_front().expect("OUT OF REGISTERS!");
-                    machine_register_map.insert(*r, register);
+    dbg!(&ctx);
+    // TODO: investigate the different types of labels
+    let mut bb_map: BTreeMap<BasicBlockIndex, DynamicLabel> = BTreeMap::new();
+    for (i, basic_block) in ctx.iterate_basic_blocks() {
+        let ent = bb_map.entry(i).or_insert_with(|| ops.new_dynamic_label());
+        dynasm!(ops
+                ; => *ent);
+        for inst in basic_block.iterate_instructions() {
+            match *inst {
+                IR::PrintConstant { ref constant_ref } => {
+                    let const_loc = constant_map[constant_ref];
+                    let len = ctx.get_constant(*constant_ref).unwrap().len();
+                    dynasm!(ops
+                                ; push rax
+                                ; push rcx
+                                ; push rdx
+                                ; push rsi
+                                ; push rdi
+                                ; push r8
+                                ; push r9
+                                ; push r10
+                                ; push r11
+                                ; lea rdi, [=>const_loc]
+                                ; xor esi, esi
+                                ; mov si, BYTE len as _
+                                ; mov rax, QWORD guest_print as _
+                                ; call rax
+                                ; pop r11
+                                ; pop r10
+                                ; pop r9
+                                ; pop r8
+                                ; pop rdi
+                                ; pop rsi
+                                ; pop rdx
+                                ; pop rcx
+                                ; pop rax
+                    );
                 }
-                RegisterEvent::Release(r) => {
-                    let register = machine_register_map[r];
-                    registers.push_front(register);
+                IR::Jump { bb_idx } => {
+                    let j_ent = bb_map.entry(bb_idx).or_insert_with(|| ops.new_dynamic_label());
+                    dynasm!(ops
+                        ; jmp => *j_ent
+                        ; ret )
                 }
+                _ => unimplemented!("not yet"),
             }
         }
     }
+
+    /*
 
     // =================================================================
     // generate some machine code
 
-    start_offset = ops.offset();
     let mut label_map: BTreeMap<usize, _> = BTreeMap::new();
     for (location, instruction) in instruction_stream.iter().enumerate() {
         if let Some(v) = label_map.get(&location) {
@@ -396,27 +334,33 @@ pub fn generate_code(
                         ; jz =>jump_loc
                         ; ret );
             }
+            // Caller saved registers:
+            //  RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11
             IR::Print { ref value } => {
                 dynasm!(ops
-                        ; sub rsp, BYTE 0x28
                         ; push rax
-                        ; push rdx
                         ; push rcx
-                        ; push rbp
-                        ; mov rbp, rsp
-                        ; lea rcx, [->hello]
-                        ; xor edx, edx
-                        ; mov dl, BYTE value.len() as _
+                        ; push rdx
+                        ; push rsi
+                        ; push rdi
+                        ; push r8
+                        ; push r9
+                        ; push r10
+                        ; push r11
+                        ; lea rdi, [->hello]
+                        ; xor esi, esi
+                        ; mov si, BYTE value.len() as _
                         ; mov rax, QWORD guest_print as _
-                        ; sub rsp, BYTE 0x28
                         ; call rax
-                        ; add rsp, BYTE 0x28
-                        ; mov rsp, rbp
-                        ; pop rbp
-                        ; pop rcx
+                        ; pop r11
+                        ; pop r10
+                        ; pop r9
+                        ; pop r8
+                        ; pop rdi
+                        ; pop rsi
                         ; pop rdx
+                        ; pop rcx
                         ; pop rax
-                        ; add rsp, BYTE 0x28
                 );
             }
             IR::Label { label_idx } => {
@@ -430,6 +374,7 @@ pub fn generate_code(
             _ => panic!("Instruction not yet implemented in codegen"),
         }
     }
+        */
 
     ops.finalize()
         .map_err(|_| CodeGenError {

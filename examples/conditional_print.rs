@@ -1,47 +1,52 @@
 use shiba_jit::{codegen::x86_64::*, ir::*, *};
 
 fn main() {
-    let program = vec![
-        IR::Label { label_idx: 0 },
-        IR::Print {
-            value: "Hello, world\n".to_string(),
-        },
-        IR::Immediate {
+    let mut ctx = Context::new();
+    let hello_world_const = ctx.add_constant(b"Hello, world\n");
+    let loop_inner = ctx.new_basic_block();
+    let loop_outer = ctx.new_basic_block();
+    ctx.build_basic_block(loop_inner)
+        .add_parent(loop_outer)
+        .push_instruction(IR::PrintConstant {
+            constant_ref: hello_world_const,
+        })
+        /*        .push_instruction(IR::Immediate {
             dest_register: 0,
             _type: PrimitiveValue::U32,
             value: 2,
             alignment: 4,
-        },
-        IR::Immediate {
+        })
+        .push_instruction(IR::Immediate {
             dest_register: 1,
             _type: PrimitiveValue::U32,
             value: 2,
             alignment: 4,
-        },
-        IR::Add {
+        })
+        .push_instruction(IR::Add {
             dest_register: 2,
             src_register1: 0,
             src_register2: 1,
-        },
-        IR::Immediate {
+        })
+        .push_instruction(IR::Immediate {
             dest_register: 3,
             _type: PrimitiveValue::U32,
             value: 4,
             alignment: 4,
-        },
-        IR::Subtract {
+        })
+        .push_instruction(IR::Subtract {
             dest_register: 4,
             src_register1: 2,
             src_register2: 3,
-        },
-        IR::JumpIfEqual {
-            src_register: 4,
-            label_idx: 0,
-        },
-    ];
+        })*/
+        .finish();
 
-    let (executable_buffer, offset) = generate_code(&program).unwrap();
+    ctx.build_basic_block(loop_outer)
+        .add_parent(loop_inner)
+        .push_instruction(IR::Jump { bb_idx: loop_inner })
+        .finish();
+
+    let (executable_buffer, offset) = generate_code(&ctx).unwrap();
     let hello_fn: extern "C" fn() = unsafe { std::mem::transmute(executable_buffer.ptr(offset)) };
 
-    unsafe { hello_fn() };
+    hello_fn();
 }
