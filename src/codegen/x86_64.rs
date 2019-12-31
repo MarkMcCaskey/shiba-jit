@@ -47,7 +47,6 @@ pub enum MachineRegister {
 }
 
 pub extern "C" fn guest_print(buffer: *const u8, len: u64) {
-    dbg!("MADE IT");
     use std::io::Write;
     std::io::stdout()
         .write_all(unsafe { std::slice::from_raw_parts(buffer, len as usize) })
@@ -146,7 +145,10 @@ impl CodeGenState {
     }
 }
 
-pub fn set_up_constants(ctx: &Context, ops: &mut Assembler) -> BTreeMap<ConstantIndex, DynamicLabel> {
+pub fn set_up_constants(
+    ctx: &Context,
+    ops: &mut Assembler,
+) -> BTreeMap<ConstantIndex, DynamicLabel> {
     let mut constant_map: BTreeMap<ConstantIndex, DynamicLabel> = BTreeMap::new();
     for (i, constant) in ctx.constants.iter().enumerate() {
         // TODO: investigate dynamic vs global labels
@@ -230,7 +232,9 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                     );
                 }
                 IR::Jump { bb_idx } => {
-                    let j_ent = bb_map.entry(bb_idx).or_insert_with(|| ops.new_dynamic_label());
+                    let j_ent = bb_map
+                        .entry(bb_idx)
+                        .or_insert_with(|| ops.new_dynamic_label());
                     dynasm!(ops
                         ; jmp => *j_ent
                         ; ret )
