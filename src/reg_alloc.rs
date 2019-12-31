@@ -3,13 +3,39 @@
 //! The code here is generic and may be used with any architecture.
 
 use crate::ir::*;
-use petgraph::{graph::NodeIndex, stable_graph::StableGraph, Directed};
+use petgraph::{
+    graph::NodeIndex,
+    stable_graph::StableGraph,
+    visit::{depth_first_search, DfsEvent},
+    Directed,
+};
 use std::collections::*;
 
 pub struct GraphData {
-    pub unreduced_index_map: BTreeMap<BasicBlockIndex, NodeIndex>,
+    pub index_map: BTreeMap<BasicBlockIndex, NodeIndex>,
     pub graph: StableGraph<BasicBlockIndex, (), Directed>,
     pub reduced_graph: StableGraph<BasicBlockIndex, (), Directed>,
+}
+
+impl GraphData {
+    /// Returns the "transitive closure" of reachibilty on the reduced graph,
+    /// that is the set of all nodes that are reachable without back-edges
+    pub fn compute_reduced_reachability(&self) -> BTreeMap<NodeIndex, BTreeSet<NodeIndex>> {
+        let mut out = BTreeMap::new();
+
+        for node_idx in self.reduced_graph.node_indices() {
+            let mut connected_nodes: BTreeSet<NodeIndex> = BTreeSet::new();
+            depth_first_search(&self.reduced_graph, Some(node_idx), |event| match event {
+                DfsEvent::Discover(n, _) => {
+                    connected_nodes.insert(n);
+                }
+                _ => (),
+            });
+            out.insert(node_idx, connected_nodes);
+        }
+
+        out
+    }
 }
 
 pub fn compute_graph(bbm: &BasicBlockManager) -> GraphData {
@@ -23,6 +49,7 @@ pub fn compute_graph(bbm: &BasicBlockManager) -> GraphData {
         let ni = node_lookup[&bbi];
         for parent in bb.iter_parents() {
             let parent_ni = node_lookup[parent];
+            // update to avoid duplicates
             graph.update_edge(parent_ni, ni, ());
         }
         for exit in bb.iter_exits() {
@@ -39,7 +66,7 @@ pub fn compute_graph(bbm: &BasicBlockManager) -> GraphData {
     println!("{:?}", petgraph::dot::Dot::new(&reduced_graph));
 
     GraphData {
-        unreduced_index_map: node_lookup,
+        index_map: node_lookup,
         graph,
         reduced_graph,
     }
