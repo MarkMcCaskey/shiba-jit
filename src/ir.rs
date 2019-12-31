@@ -88,6 +88,47 @@ pub enum IR {
     },
 }
 
+impl IR {
+    pub fn get_used_registers<'a>(&'a self) -> SmallVec<[&'a RegisterIndex; 2]> {
+        let mut out = smallvec![];
+        match self {
+            IR::Add { src1, src2, .. }
+            | IR::Subtract { src1, src2, .. }
+            | IR::Multiply { src1, src2, .. }
+            | IR::Divide { src1, src2, .. } => {
+                if let Value::Register(r1) = src1 {
+                    out.push(r1);
+                }
+                if let Value::Register(r2) = src2 {
+                    out.push(r2);
+                }
+            }
+            IR::Load {
+                dest_register,
+                src_register,
+            }
+            | IR::Store {
+                dest_register,
+                src_register,
+            } => {
+                if let Value::Register(r1) = dest_register {
+                    out.push(r1);
+                }
+                if let Value::Register(r2) = src_register {
+                    out.push(r2);
+                }
+            }
+            IR::JumpIfEqual { src_register, .. } | IR::JumpIfNotEqual { src_register, .. } => {
+                if let Value::Register(r1) = src_register {
+                    out.push(r1);
+                }
+            }
+            IR::Jump { .. } | IR::PrintConstant { .. } | IR::Alloca { .. } => (),
+        }
+        out
+    }
+}
+
 /// Top level type to generate IR with
 #[derive(Debug)]
 pub struct Context {
@@ -108,12 +149,12 @@ impl Context {
 
     pub fn add_constant(&mut self, constant: &[u8]) -> ConstantIndex {
         self.constants.push(constant.to_vec());
-        ConstantIndex(self.constants.len() - 1)
+        ConstantIndex(self.constants.len() as u32 - 1)
     }
 
     // TODO: revisit types
     pub fn get_constant(&self, ci: ConstantIndex) -> Option<&Vec<u8>> {
-        self.constants.get(ci.0)
+        self.constants.get(ci.0 as usize)
     }
 
     pub fn new_basic_block(&mut self) -> BasicBlockIndex {
@@ -138,7 +179,7 @@ impl Context {
 
 // TODO: maybe use an atomic here or think about data flow and avoid a global
 lazy_static! {
-    static ref LAST_REGISTER: Mutex<usize> = Mutex::new(0);
+    static ref LAST_REGISTER: Mutex<u32> = Mutex::new(0);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +229,19 @@ impl BasicBlock {
     pub(crate) fn iter_exits(&self) -> impl Iterator<Item = &BasicBlockIndex> {
         self.exits.iter()
     }
+    pub(crate) fn iter_defined_registers(&self) -> impl Iterator<Item = &RegisterIndex> {
+        self.code.iter().filter_map(|c| match c {
+            IR::Alloca { dest_register, .. }
+            | IR::Add { dest_register, .. }
+            | IR::Subtract { dest_register, .. }
+            | IR::Multiply { dest_register, .. }
+            | IR::Divide { dest_register, .. } => Some(dest_register),
+            _ => None,
+        })
+    }
+    pub(crate) fn iter_used_registers(&self) -> impl Iterator<Item = &RegisterIndex> {
+        self.code.iter().flat_map(|c| c.get_used_registers())
+    }
 
     pub fn finish(&mut self) {}
 
@@ -234,24 +288,24 @@ impl BasicBlock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct ConstantIndex(usize);
+pub struct ConstantIndex(u32);
 
 impl ConstantIndex {
     // TODO: probably remove this and create an iterator on them directly
-    pub(crate) fn new(inner: usize) -> Self {
+    pub(crate) fn new(inner: u32) -> Self {
         Self(inner)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct BasicBlockIndex(usize);
+pub struct BasicBlockIndex(u32);
 
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct RegisterIndex(usize);
+pub struct RegisterIndex(u32);
 
 // TODO: get dominance tree (find blocks that are coupled (i.e. x dominates y if all paths to y include x))
 // DFS on the tree
@@ -282,7 +336,7 @@ impl BasicBlockManager {
         for message in self.message_recv.try_iter() {
             match message {
                 BasicBlockMessage::Jump(src, target) => {
-                    self.blocks[target.0].add_parent(src);
+                    self.blocks[target.0 as usize].add_parent(src);
                 }
             }
         }
@@ -298,7 +352,7 @@ impl BasicBlockManager {
 
     pub fn new_basic_block(&mut self) -> BasicBlockIndex {
         self.process_messages();
-        let idx = self.blocks.len();
+        let idx = self.blocks.len() as u32;
         self.blocks.push(BasicBlock {
             parents: Default::default(),
             exits: Default::default(),
@@ -307,7 +361,7 @@ impl BasicBlockManager {
             manager_chan: self.message_sender.clone(),
         });
 
-        BasicBlockIndex(self.blocks.len() - 1)
+        BasicBlockIndex(idx)
     }
 
     // TODO: probably don't expose this
@@ -317,7 +371,7 @@ impl BasicBlockManager {
     }
 
     pub fn get_mut(&mut self, bi: BasicBlockIndex) -> Option<&mut BasicBlock> {
-        self.blocks.get_mut(bi.0)
+        self.blocks.get_mut(bi.0 as usize)
     }
 
     pub(crate) fn iterate_basic_blocks(
@@ -326,7 +380,7 @@ impl BasicBlockManager {
         self.blocks
             .iter()
             .enumerate()
-            .map(|(i, b)| (BasicBlockIndex(i), b))
+            .map(|(i, b)| (BasicBlockIndex(i as u32), b))
     }
 }
 

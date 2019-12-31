@@ -157,7 +157,7 @@ pub fn set_up_constants(
                 ; => dyn_lab
                 ; .bytes constant.as_slice()
         );
-        constant_map.insert(ConstantIndex::new(i), dyn_lab);
+        constant_map.insert(ConstantIndex::new(i as _), dyn_lab);
     }
     constant_map
 }

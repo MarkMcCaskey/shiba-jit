@@ -1,9 +1,17 @@
 //! Functions and types for register allocation.
 //!
 //! The code here is generic and may be used with any architecture.
+//!
+//! The liveness querying is from and/or inspired by
+//! ["Fast Liveness Checking for SSA-Form Programs"][paper] by
+//! Benoit Boissinot, Sebastian Hack, Daniel Grund, Benoît Dupont de Dinechin,
+//! and Fabrice Rastello.
+//!
+//! [paper]: https://dl.acm.org/doi/10.1145/1356058.1356064
 
 use crate::ir::*;
 use petgraph::{
+    algo::dominators::{simple_fast, Dominators},
     graph::NodeIndex,
     stable_graph::StableGraph,
     visit::{depth_first_search, DfsEvent},
@@ -17,6 +25,98 @@ pub struct GraphData {
     pub depth_map: BTreeMap<NodeIndex, u32>,
     pub graph: StableGraph<BasicBlockIndex, (), Directed>,
     pub reduced_graph: StableGraph<BasicBlockIndex, (), Directed>,
+    pub root: NodeIndex,
+}
+
+pub struct GraphQuery {
+    graph_data: GraphData,
+    dominators: Dominators<NodeIndex>,
+    reduced_reachability: BTreeMap<NodeIndex, BTreeSet<NodeIndex>>,
+    back_edges: BTreeMap<NodeIndex, BTreeSet<NodeIndex>>,
+    /// Map showing where a register is used
+    use_map: BTreeMap<RegisterIndex, BTreeSet<NodeIndex>>,
+    /// Map showing where a register was defined
+    define_map: BTreeMap<RegisterIndex, NodeIndex>,
+}
+
+impl GraphQuery {
+    pub fn new(graph_data: GraphData, bbm: &BasicBlockManager) -> Self {
+        let (reduced_reachability, back_edges) =
+            graph_data.compute_reduced_reachability_and_back_edges();
+        let dominators = simple_fast(&graph_data.graph, graph_data.root);
+        let mut use_map: BTreeMap<RegisterIndex, BTreeSet<NodeIndex>> = BTreeMap::new();
+        let mut define_map: BTreeMap<RegisterIndex, NodeIndex> = BTreeMap::new();
+        for (idx, block) in bbm.iterate_basic_blocks() {
+            let ni = graph_data.index_map[&idx];
+            for reg_idx in block.iter_used_registers() {
+                let ent = use_map.entry(*reg_idx).or_default();
+                ent.insert(ni);
+            }
+            for reg_idx in block.iter_defined_registers() {
+                let result = define_map.insert(*reg_idx, ni);
+                assert_eq!(result, None);
+            }
+        }
+        Self {
+            graph_data,
+            dominators,
+            reduced_reachability,
+            back_edges,
+            use_map,
+            define_map,
+        }
+    }
+
+    pub fn is_live_in(&self, idx: RegisterIndex) -> bool {
+        let ni = self.define_map[&idx];
+        let strict_dominators = self
+            .dominators
+            .strict_dominators(ni)
+            .unwrap()
+            .collect::<BTreeSet<_>>();
+        let uses_set = &self.use_map[&idx];
+        for t in self.back_edges[&ni].intersection(&strict_dominators) {
+            if self.reduced_reachability[&t]
+                .intersection(&uses_set)
+                .count()
+                != 0
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn is_live_out(&self, idx: RegisterIndex, node: BasicBlockIndex) -> bool {
+        let ni = self.define_map[&idx];
+        let node_ni = self.graph_data.index_map[&node];
+        if self.define_map[&idx] == node_ni {
+            return self.use_map[&idx].iter().filter(|n| **n != node_ni).count() != 0;
+        }
+        // can avoid allocation here
+        let registers_node_dominates_node = self
+            .dominators
+            .strict_dominators(node_ni)
+            .unwrap()
+            .any(|e| e == ni);
+        if registers_node_dominates_node {
+            let strict_dominators = self
+                .dominators
+                .strict_dominators(ni)
+                .unwrap()
+                .collect::<BTreeSet<_>>();
+            for t in self.back_edges[&ni].intersection(&strict_dominators) {
+                let mut u = self.use_map[&idx].clone();
+                if *t == node_ni && !self.back_edges[&node_ni].contains(&node_ni) {
+                    u.remove(&node_ni);
+                }
+                if self.reduced_reachability[&t].intersection(&u).count() != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 impl GraphData {
@@ -90,6 +190,7 @@ pub fn compute_graph(bbm: &BasicBlockManager) -> GraphData {
         depth_map,
         graph,
         reduced_graph,
+        root: start_ni,
     }
 }
 
