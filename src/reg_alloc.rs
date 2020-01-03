@@ -67,6 +67,7 @@ impl GraphQuery {
         }
     }
 
+    /// Register is live coming into this basic block
     pub fn is_live_in(&self, idx: RegisterIndex, node: BasicBlockIndex) -> bool {
         let ni = self.define_map[&idx];
         let node_ni = self.graph_data.index_map[&node];
@@ -88,11 +89,14 @@ impl GraphQuery {
         false
     }
 
+    /// Register is live coming out of this basic block
     pub fn is_live_out(&self, idx: RegisterIndex, node: BasicBlockIndex) -> bool {
         let ni = self.define_map[&idx];
         let node_ni = self.graph_data.index_map[&node];
         if self.define_map[&idx] == node_ni {
-            return self.use_map[&idx].iter().filter(|n| **n != node_ni).count() != 0;
+            // handle defined but never used variables
+            return self.use_map.get(&idx).is_some()
+                && self.use_map[&idx].iter().filter(|n| **n != node_ni).count() != 0;
         }
         // can avoid allocation here
         let registers_node_dominates_node = self

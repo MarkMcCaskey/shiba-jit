@@ -18,7 +18,7 @@ pub struct Register {
     _type: PrimitiveValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Value {
     Register(RegisterIndex),
     Immediate { _type: PrimitiveValue, value: usize },
@@ -62,7 +62,7 @@ pub enum IR {
     },
     /// Src is a pointer that's  dereffed
     Load {
-        dest_register: Value,
+        dest_register: RegisterIndex,
         src_register: Value,
     },
     /// Dest is a pointer that's dereffed
@@ -86,6 +86,7 @@ pub enum IR {
     PrintConstant {
         constant_ref: ConstantIndex,
     },
+    Return,
 }
 
 impl IR {
@@ -106,8 +107,13 @@ impl IR {
             IR::Load {
                 dest_register,
                 src_register,
+            } => {
+                out.push(dest_register);
+                if let Value::Register(r2) = src_register {
+                    out.push(r2);
+                }
             }
-            | IR::Store {
+            IR::Store {
                 dest_register,
                 src_register,
             } => {
@@ -123,7 +129,7 @@ impl IR {
                     out.push(r1);
                 }
             }
-            IR::Jump { .. } | IR::PrintConstant { .. } | IR::Alloca { .. } => (),
+            IR::Jump { .. } | IR::PrintConstant { .. } | IR::Alloca { .. } | IR::Return => (),
         }
         out
     }
@@ -136,7 +142,7 @@ pub struct Context {
     pub(crate) constants: Vec<Vec<u8>>,
     // TODO: add global variables here
     /// The basic block / CFG
-    basic_blocks: BasicBlockManager,
+    pub(crate) basic_blocks: BasicBlockManager,
 }
 
 impl Context {
@@ -235,6 +241,7 @@ impl BasicBlock {
             | IR::Add { dest_register, .. }
             | IR::Subtract { dest_register, .. }
             | IR::Multiply { dest_register, .. }
+            | IR::Load { dest_register, .. }
             | IR::Divide { dest_register, .. } => Some(dest_register),
             _ => None,
         })
@@ -247,6 +254,46 @@ impl BasicBlock {
 
     pub(crate) fn iterate_instructions(&self) -> impl Iterator<Item = &IR> {
         self.code.iter()
+    }
+
+    pub fn alloca(&mut self, _type: PrimitiveValue, alignment: u8) -> Value {
+        let n = {
+            let mut lr = LAST_REGISTER.lock().unwrap();
+            *lr += 1;
+            *lr
+        };
+        let ri = RegisterIndex(n);
+        self.code.push(IR::Alloca {
+            dest_register: ri,
+            _type,
+            alignment,
+        });
+        Value::Register(ri)
+    }
+
+    pub fn ret(&mut self) {
+        self.code.push(IR::Return);
+    }
+
+    pub fn load(&mut self, src: Value) -> Value {
+        let n = {
+            let mut lr = LAST_REGISTER.lock().unwrap();
+            *lr += 1;
+            *lr
+        };
+        let ri = RegisterIndex(n);
+        self.code.push(IR::Load {
+            dest_register: ri,
+            src_register: src,
+        });
+        Value::Register(ri)
+    }
+
+    pub fn store(&mut self, dest: Value, src: Value) {
+        self.code.push(IR::Store {
+            dest_register: dest,
+            src_register: src,
+        });
     }
 
     pub fn add(&mut self, v1: Value, v2: Value) -> Value {
@@ -284,6 +331,28 @@ impl BasicBlock {
         self.code.push(IR::Jump { bb_idx: target });
         self.manager_chan
             .send(BasicBlockMessage::Jump(self.self_idx, target))
+            .unwrap();
+    }
+
+    /// jumps if register is 0
+    pub fn jump_if_equal(
+        &mut self,
+        register: Value,
+        true_target: BasicBlockIndex,
+        false_target: BasicBlockIndex,
+    ) {
+        self.exits.push(true_target);
+        self.exits.push(false_target);
+        self.code.push(IR::JumpIfEqual {
+            src_register: register,
+            true_bb_idx: true_target,
+            false_bb_idx: false_target,
+        });
+        self.manager_chan
+            .send(BasicBlockMessage::Jump(self.self_idx, true_target))
+            .unwrap();
+        self.manager_chan
+            .send(BasicBlockMessage::Jump(self.self_idx, false_target))
             .unwrap();
     }
 }
@@ -372,6 +441,9 @@ impl BasicBlockManager {
 
     pub fn get_mut(&mut self, bi: BasicBlockIndex) -> Option<&mut BasicBlock> {
         self.blocks.get_mut(bi.0 as usize)
+    }
+    pub fn get(&self, bi: BasicBlockIndex) -> Option<&BasicBlock> {
+        self.blocks.get(bi.0 as usize)
     }
 
     pub(crate) fn iterate_basic_blocks(

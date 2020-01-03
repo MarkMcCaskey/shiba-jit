@@ -1,4 +1,5 @@
 use crate::ir::*;
+use crate::reg_alloc;
 use std::collections::*;
 use std::iter;
 use std::mem;
@@ -24,6 +25,101 @@ pub struct CodeGenError {
     /// Which IR instruction the error happened at
     location: usize,
     reason: CodeGenErrorReason,
+}
+
+// does not handle register spilling right now
+// TODO: handle register spilling
+fn compute_register_map(bbm: &BasicBlockManager) -> BTreeMap<RegisterIndex, MachineRegister> {
+    let mut available_registers = VecDeque::new();
+    available_registers.push_back(MachineRegister::Rdx);
+    available_registers.push_back(MachineRegister::Rbx);
+    available_registers.push_back(MachineRegister::R8);
+    available_registers.push_back(MachineRegister::R9);
+    available_registers.push_back(MachineRegister::R10);
+    available_registers.push_back(MachineRegister::R11);
+    available_registers.push_back(MachineRegister::R12);
+    available_registers.push_back(MachineRegister::R13);
+    available_registers.push_back(MachineRegister::R14);
+    available_registers.push_back(MachineRegister::R15);
+    let current_mapping: BTreeMap<RegisterIndex, MachineRegister> = BTreeMap::new();
+    let mut out: BTreeMap<RegisterIndex, MachineRegister> = BTreeMap::new();
+    let gd = reg_alloc::compute_graph(bbm);
+    let gq = reg_alloc::GraphQuery::new(gd, bbm);
+    let mut seen = BTreeSet::new();
+    build_register_map_inner(
+        bbm,
+        &gq,
+        bbm.start,
+        &mut out,
+        current_mapping,
+        available_registers,
+        &mut seen,
+    );
+
+    out
+}
+
+fn build_register_map_inner(
+    bbm: &BasicBlockManager,
+    gq: &reg_alloc::GraphQuery,
+    cur_idx: BasicBlockIndex,
+    reg_map: &mut BTreeMap<RegisterIndex, MachineRegister>,
+    mut current_map: BTreeMap<RegisterIndex, MachineRegister>,
+    mut available_registers: VecDeque<MachineRegister>,
+    seen: &mut BTreeSet<BasicBlockIndex>,
+) {
+    if seen.contains(&cur_idx) {
+        return;
+    } else {
+        seen.insert(cur_idx);
+    }
+
+    // =====================================================
+    // free registers that are not used on this path
+    // TODO: optimize [this can probably avoid the clone AND also only be done
+    // in cases where the parent has multiple paths]
+    let cm_copy = current_map.clone();
+    for (k, _) in cm_copy {
+        if !gq.is_live_in(k, cur_idx) {
+            let machine_reg = current_map.remove(&k).unwrap();
+            available_registers.push_back(machine_reg);
+        }
+    }
+
+    // TODO: generate liveness info from inside basic blocks too to reduce register pressure
+    // this should cause basic tests to fail in the short-term so should be implemented
+    // very soon
+    for declared_reg in bbm.get(cur_idx).unwrap().iter_defined_registers() {
+        let machine_reg = available_registers
+            .pop_front()
+            .expect("Ran out of machine registers! Need to implement register spilling");
+        let existing_reg = current_map.insert(*declared_reg, machine_reg);
+        assert!(existing_reg.is_none());
+        let existing_reg = reg_map.insert(*declared_reg, machine_reg);
+        assert!(existing_reg.is_none());
+    }
+
+    // =====================================================
+    // free registers that are not used on any path after
+    // TODO: optimize
+    let cm_copy = current_map.clone();
+    for (k, _) in cm_copy {
+        if !gq.is_live_out(k, cur_idx) {
+            let machine_reg = current_map.remove(&k).unwrap();
+            available_registers.push_back(machine_reg);
+        }
+    }
+    for exit in bbm.get(cur_idx).unwrap().iter_exits() {
+        build_register_map_inner(
+            bbm,
+            gq,
+            *exit,
+            reg_map,
+            current_map.clone(),
+            available_registers.clone(),
+            seen,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +289,9 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
     // generate some machine code
     start_offset = ops.offset();
 
-    dbg!(&ctx);
+    let register_map = compute_register_map(&ctx.basic_blocks);
+    dbg!(&register_map);
+
     // TODO: investigate the different types of labels
     let mut bb_map: BTreeMap<BasicBlockIndex, DynamicLabel> = BTreeMap::new();
     for (i, basic_block) in ctx.iterate_basic_blocks() {
@@ -238,6 +336,173 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                     dynasm!(ops
                         ; jmp => *j_ent
                         ; ret )
+                }
+                IR::JumpIfEqual {
+                    src_register,
+                    true_bb_idx,
+                    false_bb_idx,
+                } => {
+                    // TODO: evaluate IR in the context of this instruction: seems suboptimal
+                    let true_ent = bb_map
+                        .entry(true_bb_idx)
+                        .or_insert_with(|| ops.new_dynamic_label())
+                        .clone();
+                    let false_ent = bb_map
+                        .entry(false_bb_idx)
+                        .or_insert_with(|| ops.new_dynamic_label());
+                    match src_register {
+                        Value::Register(r1) => {
+                            let mr1 = register_map[&r1];
+                            dynasm!(ops
+                                    ; cmp Ra(mr1 as u8), DWORD 0
+                                    ; je => true_ent
+                                    ; jmp => *false_ent
+                                    ; ret )
+                        }
+                        _ => unimplemented!("Conditional jumps on immediate values"),
+                    }
+                }
+                IR::Add {
+                    dest_register,
+                    src1,
+                    src2,
+                } => {
+                    let mdest = register_map[&dest_register];
+                    match (src1, src2) {
+                        (Value::Register(r1), Value::Register(r2)) => {
+                            let mr1 = register_map[&r1];
+                            let mr2 = register_map[&r2];
+                            dynasm!(ops
+                                     ; mov Ra(mdest as u8), Ra(mr1 as u8)
+                                     ; add Ra(mdest as u8), Ra(mr2 as u8)
+                            );
+                        }
+                        (Value::Register(r1), Value::Immediate { _type, value })
+                        | (Value::Immediate { _type, value }, Value::Register(r1)) => {
+                            let mr1 = register_map[&r1];
+                            emit_mov_imm(&mut ops, mdest, value, _type);
+                            dynasm!(ops
+                                   ; add Ra(mdest as u8), Ra(mr1 as u8)
+                            );
+                        }
+                        (
+                            Value::Immediate { _type, value: v1 },
+                            Value::Immediate { value: v2, .. },
+                        ) => {
+                            emit_mov_imm(&mut ops, mdest, v1 + v2, _type);
+                        }
+                    }
+                }
+                IR::Subtract {
+                    dest_register,
+                    src1,
+                    src2,
+                } => {
+                    let mdest = register_map[&dest_register];
+                    match (src1, src2) {
+                        (Value::Register(r1), Value::Register(r2)) => {
+                            let mr1 = register_map[&r1];
+                            let mr2 = register_map[&r2];
+                            dynasm!(ops
+                                     ; mov Ra(mdest as u8), Ra(mr1 as u8)
+                                     ; sub Ra(mdest as u8), Ra(mr2 as u8)
+                            );
+                        }
+                        (Value::Register(_), Value::Immediate { .. }) => {
+                            // emit_mov_imm is insufficient hee
+                            todo!("Implement this by updating the core abstraction");
+                            /*let mr1 = register_map[&r1];
+                            dynasm!(ops
+                                    ; mov Ra(mdest as u8), Ra(mr1 as u8));
+                            emit_mov_imm(&mut ops, mdest, value, _type);
+                            dynasm!(ops
+                                   ; sub Ra(mdest as u8), Ra(mr1 as u8)
+                            );*/
+                        }
+                        (Value::Immediate { _type, value }, Value::Register(r2)) => {
+                            let mr2 = register_map[&r2];
+                            emit_mov_imm(&mut ops, mdest, value, _type);
+                            dynasm!(ops
+                                   ; sub Ra(mdest as u8), Ra(mr2 as u8)
+                            );
+                        }
+                        (
+                            Value::Immediate { _type, value: v1 },
+                            Value::Immediate { value: v2, .. },
+                        ) => {
+                            emit_mov_imm(&mut ops, mdest, v1 - v2, _type);
+                        }
+                    }
+                }
+                IR::Alloca {
+                    dest_register,
+                    _type,
+                    ..
+                } => {
+                    let mdest = register_map[&dest_register];
+                    match _type {
+                        PrimitiveValue::I32 | PrimitiveValue::U32 => {
+                            dynasm!(ops
+                                    ; sub rsp, 0x8
+                                    ; mov Ra(mdest as u8), rsp
+                            );
+                        }
+                        _ => {
+                            unimplemented!("should probably rewrite allocas and not implement this")
+                        }
+                    }
+                }
+                IR::Load {
+                    dest_register,
+                    src_register,
+                } => {
+                    let mdest = register_map[&dest_register];
+                    match src_register {
+                        Value::Register(src) => {
+                            let msrc = register_map[&src];
+                            dynasm!(ops
+                                    ; mov Ra(mdest as u8), [Ra(msrc as u8)]
+                            );
+                        }
+                        Value::Immediate { .. } => {
+                            todo!("deref raw pointers");
+                            // lazy hack, assert pointer type; should be done in validation
+                            /*assert!(_type == PrimitiveValue::U64);
+                            dynasm!(ops
+                                    ; mov Ra(mdest as u8), (QWORD value))*/
+                        }
+                    }
+                }
+                IR::Store {
+                    dest_register,
+                    src_register,
+                } => match (dest_register, src_register) {
+                    (Value::Register(dest), Value::Register(src)) => {
+                        let mdest = register_map[&dest];
+                        let msrc = register_map[&src];
+
+                        dynasm!(ops
+                                ; mov [Ra(mdest as u8)], Ra(msrc as u8)
+                        );
+                    }
+                    (Value::Register(dest), Value::Immediate { _type, value }) => {
+                        let mdest = register_map[&dest];
+                        match _type {
+                            PrimitiveValue::U32 => {
+                                dynasm!(ops
+                                        ; mov eax, DWORD value as i32
+                                        ; mov [Ra(mdest as u8)], eax
+                                );
+                            }
+                            _ => unimplemented!("storing anything but a u32"),
+                        }
+                    }
+                    _ => unimplemented!("Store for constant destinations"),
+                },
+                IR::Return => {
+                    dynasm!(ops
+                           ; ret
+                    );
                 }
                 _ => unimplemented!("not yet"),
             }
@@ -385,5 +650,14 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
             location: 0,
             reason: CodeGenErrorReason::CodeGenFailure,
         })
-        .map(|r| (r, start_offset))
+        .map(|r| {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open("out")
+                .unwrap();
+            f.write_all(&*r).unwrap();
+            (r, start_offset)
+        })
 }
