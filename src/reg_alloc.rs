@@ -67,15 +67,16 @@ impl GraphQuery {
         }
     }
 
-    pub fn is_live_in(&self, idx: RegisterIndex) -> bool {
+    pub fn is_live_in(&self, idx: RegisterIndex, node: BasicBlockIndex) -> bool {
         let ni = self.define_map[&idx];
+        let node_ni = self.graph_data.index_map[&node];
         let strict_dominators = self
             .dominators
             .strict_dominators(ni)
             .unwrap()
             .collect::<BTreeSet<_>>();
         let uses_set = &self.use_map[&idx];
-        for t in self.back_edges[&ni].intersection(&strict_dominators) {
+        for t in self.back_edges[&node_ni].intersection(&strict_dominators) {
             if self.reduced_reachability[&t]
                 .intersection(&uses_set)
                 .count()
