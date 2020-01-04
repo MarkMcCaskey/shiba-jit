@@ -1,8 +1,6 @@
 use crate::ir::*;
 use crate::reg_alloc;
 use std::collections::*;
-use std::iter;
-use std::mem;
 
 use dynasmrt::x64::Assembler;
 use dynasmrt::{mmap::ExecutableBuffer, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi};
@@ -155,13 +153,15 @@ fn emit_mov_imm(ops: &mut Assembler, dest: MachineRegister, imm: usize, _type: P
             let val = imm as u8 as i32;
             // 32bit
             dynasm!(ops
-                    ; mov Ra(dest as u8), BYTE val
+                    ; xor Rd(dest as u8), Rd(dest as u8)
+                    ; mov Rd(dest as u8), BYTE val
             );
         }
         PrimitiveValue::U16 | PrimitiveValue::I16 => {
             let val = imm as u16 as i32;
             // 32bit
             dynasm!(ops
+                    ; xor Rd(dest as u8), Rd(dest as u8)
                     ; mov Ra(dest as u8), WORD val
             );
         }
@@ -169,6 +169,7 @@ fn emit_mov_imm(ops: &mut Assembler, dest: MachineRegister, imm: usize, _type: P
             let val = imm as i32;
             // 32bit
             dynasm!(ops
+                    ; xor Rd(dest as u8), Rd(dest as u8)
                     ; mov Ra(dest as u8), DWORD val
             );
         }
@@ -196,51 +197,6 @@ pub enum CodeGenErrorReason {
     CodeGenFailure,
 }
 
-#[derive(Debug, Default)]
-pub struct CodeGenState {
-    register_map: BTreeMap<usize, Register>,
-    /// when the registers were first seen
-    register_first_seen: BTreeMap<usize, usize>,
-    /// when the registers were last seen
-    register_last_seen: BTreeMap<usize, usize>,
-    /// label_id -> idx in out
-    label_map: BTreeMap<usize, usize>,
-}
-
-impl CodeGenState {
-    fn create_register(
-        &mut self,
-        register: usize,
-        _type: PrimitiveValue,
-        value: RegisterValueLocation,
-        location: usize,
-    ) -> Result<(), CodeGenError> {
-        let res = self
-            .register_map
-            .insert(register, Register { _type, value });
-        if res.is_some() {
-            return Err(CodeGenError {
-                location,
-                reason: CodeGenErrorReason::RegisterValueTaken(register),
-            });
-        }
-        self.register_first_seen.insert(register, location);
-        self.register_last_seen.insert(register, location);
-        Ok(())
-    }
-
-    fn get_register(&mut self, register: usize, location: usize) -> Result<Register, CodeGenError> {
-        *self.register_last_seen.get_mut(&register).unwrap() = location;
-        self.register_map
-            .get(&register)
-            .cloned()
-            .ok_or_else(|| CodeGenError {
-                location,
-                reason: CodeGenErrorReason::RegisterNotFound(register),
-            })
-    }
-}
-
 pub fn set_up_constants(
     ctx: &Context,
     ops: &mut Assembler,
@@ -265,20 +221,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
             ; .arch x64
     );
 
-    let mut start_offset = ops.offset();
-
-    let mut cgs = CodeGenState::default();
-
-    let assert_type = |type1, type2, location| {
-        if type1 == type2 {
-            Ok(())
-        } else {
-            return Err(CodeGenError {
-                location,
-                reason: CodeGenErrorReason::TypeMismatch(type1, type2),
-            });
-        }
-    };
+    let start_offset;
 
     // =================================================================
     // set up the constants
@@ -290,7 +233,14 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
     start_offset = ops.offset();
 
     let register_map = compute_register_map(&ctx.basic_blocks);
-    dbg!(&register_map);
+    dynasm!(ops
+            ; push rbp
+            ; mov rbp, rsp
+            ; sub rsp, 0x8
+            ; push rbx
+            ; push rdi
+            ; push rsi
+    );
 
     // TODO: investigate the different types of labels
     let mut bb_map: BTreeMap<BasicBlockIndex, DynamicLabel> = BTreeMap::new();
@@ -335,7 +285,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                         .or_insert_with(|| ops.new_dynamic_label());
                     dynasm!(ops
                         ; jmp => *j_ent
-                        ; ret )
+                    );
                 }
                 IR::JumpIfEqual {
                     src_register,
@@ -357,7 +307,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                                     ; cmp Ra(mr1 as u8), DWORD 0
                                     ; je => true_ent
                                     ; jmp => *false_ent
-                                    ; ret )
+                            )
                         }
                         _ => unimplemented!("Conditional jumps on immediate values"),
                     }
@@ -443,8 +393,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                     match _type {
                         PrimitiveValue::I32 | PrimitiveValue::U32 => {
                             dynasm!(ops
-                                    ; sub rsp, 0x8
-                                    ; mov Ra(mdest as u8), rsp
+                                    ; lea Ra(mdest as u8), [rbp - 4]
                             );
                         }
                         _ => {
@@ -461,7 +410,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                         Value::Register(src) => {
                             let msrc = register_map[&src];
                             dynasm!(ops
-                                    ; mov Ra(mdest as u8), [Ra(msrc as u8)]
+                                    ; mov Rd(mdest as u8), [Ra(msrc as u8)]
                             );
                         }
                         Value::Immediate { .. } => {
@@ -487,6 +436,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                     }
                     (Value::Register(dest), Value::Immediate { _type, value }) => {
                         let mdest = register_map[&dest];
+
                         match _type {
                             PrimitiveValue::U32 => {
                                 dynasm!(ops
@@ -501,7 +451,13 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                 },
                 IR::Return => {
                     dynasm!(ops
-                           ; ret
+                            ; pop rsi
+                            ; pop rdi
+                            ; pop rbx
+                            ; add rsp, 0x8
+                            ; mov rsp, rbp
+                            ; pop rbp
+                            ; ret
                     );
                 }
                 _ => unimplemented!("not yet"),
@@ -657,7 +613,7 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                 .create(true)
                 .open("out")
                 .unwrap();
-            f.write_all(&*r).unwrap();
+            f.write_all(&r[start_offset.0..]).unwrap();
             (r, start_offset)
         })
 }

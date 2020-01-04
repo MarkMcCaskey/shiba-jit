@@ -24,6 +24,10 @@ fn main() {
     let sub_result = inner_bb.subtract(Value::u32(4), add_result);
     inner_bb.finish();
 
+    ctx.build_basic_block(loop_outer)
+        .add_parent(loop_inner)
+        .jump_if_equal(sub_result, loop_exit, loop_inner);
+
     let loop_exit_bb = ctx.build_basic_block(loop_exit);
     loop_exit_bb
         .add_parent(loop_outer)
@@ -33,10 +37,6 @@ fn main() {
     loop_exit_bb.ret();
     loop_exit_bb.finish();
 
-    ctx.build_basic_block(loop_outer)
-        .add_parent(loop_inner)
-        .jump_if_equal(sub_result, loop_inner, loop_exit);
-
     ctx.finalize();
     println!("IR finished!");
 
@@ -45,5 +45,12 @@ fn main() {
     println!("Compilation finished!");
     let hello_fn: extern "C" fn() = unsafe { std::mem::transmute(executable_buffer.ptr(offset)) };
 
-    hello_fn();
+    im_going_to_break_here(hello_fn);
+}
+
+// useful for setting breakpoints to walk through the generated code
+#[inline(never)]
+#[no_mangle]
+fn im_going_to_break_here(f: extern "C" fn()) {
+    f()
 }
