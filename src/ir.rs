@@ -1,4 +1,5 @@
 use smallvec::SmallVec;
+use std::collections::BTreeMap;
 use std::sync::{mpsc, Mutex};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -133,6 +134,18 @@ impl IR {
         }
         out
     }
+
+    pub fn get_defined_register(&self) -> Option<&RegisterIndex> {
+        match self {
+            IR::Alloca { dest_register, .. }
+            | IR::Add { dest_register, .. }
+            | IR::Subtract { dest_register, .. }
+            | IR::Multiply { dest_register, .. }
+            | IR::Load { dest_register, .. }
+            | IR::Divide { dest_register, .. } => Some(dest_register),
+            _ => None,
+        }
+    }
 }
 
 /// Top level type to generate IR with
@@ -236,18 +249,30 @@ impl BasicBlock {
         self.exits.iter()
     }
     pub(crate) fn iter_defined_registers(&self) -> impl Iterator<Item = &RegisterIndex> {
-        self.code.iter().filter_map(|c| match c {
-            IR::Alloca { dest_register, .. }
-            | IR::Add { dest_register, .. }
-            | IR::Subtract { dest_register, .. }
-            | IR::Multiply { dest_register, .. }
-            | IR::Load { dest_register, .. }
-            | IR::Divide { dest_register, .. } => Some(dest_register),
-            _ => None,
-        })
+        self.code.iter().filter_map(IR::get_defined_register)
     }
     pub(crate) fn iter_used_registers(&self) -> impl Iterator<Item = &RegisterIndex> {
         self.code.iter().flat_map(|c| c.get_used_registers())
+    }
+
+    pub(crate) fn get_last_used_map(&self) -> BTreeMap<RegisterIndex, u32> {
+        let mut out = BTreeMap::new();
+        for (i, inst) in self.code.iter().enumerate() {
+            for used_register in inst.get_used_registers() {
+                let ent = out.entry(*used_register).or_default();
+                *ent = i as u32;
+            }
+        }
+        out
+    }
+
+    pub(crate) fn get_reverse_last_used_map(&self) -> BTreeMap<u32, SmallVec<[RegisterIndex; 2]>> {
+        let mut out: BTreeMap<u32, SmallVec<[RegisterIndex; 2]>> = BTreeMap::new();
+        for (k, v) in self.get_last_used_map() {
+            let ent = out.entry(v).or_default();
+            ent.push(k);
+        }
+        out
     }
 
     pub fn finish(&mut self) {}

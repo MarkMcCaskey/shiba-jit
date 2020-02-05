@@ -57,6 +57,19 @@ fn compute_register_map(bbm: &BasicBlockManager) -> BTreeMap<RegisterIndex, Mach
     out
 }
 
+// to detect liveness information inside a basic block we can:
+// forall registers r where r is not liveout in this node,
+//    find the last read of r
+//
+// when building register map:
+// iterate through IR instructions, if IR offset is the last use of a register,
+// use that machine register
+//
+// to do this well, we'll need an iterator over IR points that contains
+// variable declaration and use info.  It can skip IR that don't use registers
+// but it must return the proper index into the IR for every instruction that
+// does use or declare registers.
+
 fn build_register_map_inner(
     bbm: &BasicBlockManager,
     gq: &reg_alloc::GraphQuery,
@@ -78,7 +91,12 @@ fn build_register_map_inner(
     // in cases where the parent has multiple paths]
     let cm_copy = current_map.clone();
     for (k, _) in cm_copy {
+        // having a bug with `is_live_in` here when running the example, TODO: fix
         if !gq.is_live_in(k, cur_idx) {
+            println!(
+                "FREEING REGISTER {:?} because it's not used in this block",
+                k
+            );
             let machine_reg = current_map.remove(&k).unwrap();
             available_registers.push_back(machine_reg);
         }
@@ -87,26 +105,49 @@ fn build_register_map_inner(
     // TODO: generate liveness info from inside basic blocks too to reduce register pressure
     // this should cause basic tests to fail in the short-term so should be implemented
     // very soon
-    for declared_reg in bbm.get(cur_idx).unwrap().iter_defined_registers() {
-        let machine_reg = available_registers
-            .pop_front()
-            .expect("Ran out of machine registers! Need to implement register spilling");
-        let existing_reg = current_map.insert(*declared_reg, machine_reg);
-        assert!(existing_reg.is_none());
-        let existing_reg = reg_map.insert(*declared_reg, machine_reg);
-        assert!(existing_reg.is_none());
-    }
+    let rev_last_used_map = bbm.get(cur_idx).unwrap().get_reverse_last_used_map();
 
-    // =====================================================
-    // free registers that are not used on any path after
-    // TODO: optimize
-    let cm_copy = current_map.clone();
-    for (k, _) in cm_copy {
-        if !gq.is_live_out(k, cur_idx) {
-            let machine_reg = current_map.remove(&k).unwrap();
-            available_registers.push_back(machine_reg);
+    let mut to_clean_up = VecDeque::new();
+    dbg!("begin bb");
+    for (i, inst) in bbm.get(cur_idx).unwrap().iterate_instructions().enumerate() {
+        dbg!(&current_map);
+        if let Some(last_useds) = rev_last_used_map.get(&(i as u32)) {
+            for last_used in last_useds.iter() {
+                if !gq.is_live_out(*last_used, cur_idx) {
+                    if let Some(machine_reg) = current_map.remove(&last_used) {
+                        println!("FREEING {:?}", last_used);
+                        available_registers.push_front(machine_reg);
+                    } else {
+                        // if a register is never used again but we haven't seen
+                        // it yet, then we'll clean it up after we use it
+                        dbg!(last_used);
+                        to_clean_up.push_back(last_used);
+                    }
+                } else {
+                    dbg!("USED AGAIN!");
+                    dbg!(last_used);
+                }
+            }
+        }
+        dbg!(inst);
+        if let Some(v) = inst.get_defined_register() {
+            dbg!(v);
+            let machine_reg = available_registers
+                .pop_front()
+                .expect("Ran out of machine registers! Need to implement register spilling");
+            let existing_reg = current_map.insert(*v, machine_reg);
+            assert!(existing_reg.is_none());
+            let existing_reg = reg_map.insert(*v, machine_reg);
+            assert!(existing_reg.is_none());
+        }
+
+        while let Some(reg) = to_clean_up.pop_front() {
+            println!("CLEANING UP DOWN HERE! {:?}", reg);
+            let mr = current_map.remove(&reg).unwrap();
+            available_registers.push_front(mr);
         }
     }
+
     for exit in bbm.get(cur_idx).unwrap().iter_exits() {
         build_register_map_inner(
             bbm,
@@ -339,7 +380,8 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                             Value::Immediate { _type, value: v1 },
                             Value::Immediate { value: v2, .. },
                         ) => {
-                            emit_mov_imm(&mut ops, mdest, v1 + v2, _type);
+                            // TODO: decide overflow behavior
+                            emit_mov_imm(&mut ops, mdest, v1.wrapping_add(v2), _type);
                         }
                     }
                 }
@@ -380,7 +422,8 @@ pub fn generate_code(ctx: &Context) -> Result<(ExecutableBuffer, AssemblyOffset)
                             Value::Immediate { _type, value: v1 },
                             Value::Immediate { value: v2, .. },
                         ) => {
-                            emit_mov_imm(&mut ops, mdest, v1 - v2, _type);
+                            // TODO: decide underflow behavior
+                            emit_mov_imm(&mut ops, mdest, v1.wrapping_sub(v2), _type);
                         }
                     }
                 }
