@@ -77,16 +77,14 @@ impl GraphQuery {
             .unwrap()
             .collect::<BTreeSet<_>>();
         let uses_set = &self.use_map[&idx];
-        for t in self.back_edges[&node_ni].intersection(&strict_dominators) {
-            if self.reduced_reachability[&t]
-                .intersection(&uses_set)
-                .count()
-                != 0
-            {
-                return true;
-            }
-        }
-        false
+        self.back_edges[&node_ni]
+            .intersection(&strict_dominators)
+            .any(|t| {
+                self.reduced_reachability[&t]
+                    .intersection(&uses_set)
+                    .count()
+                    != 0
+            })
     }
 
     /// Register is live coming out of this basic block
